@@ -1,19 +1,5 @@
 """TemporaSMS integration (https://temporasms.com).
-
-Powers
-  WhatsApp  Server 2  -> "Fast & Smart Service"  (operator=smart routing)
-  Telegram  Server 3  -> "Change TG No"
-  All apps sms        -> every service the panel sells (WhatsApp / Telegram have their own menus)
-
-The API speaks the Hero-SMS / SMS-Activate dialect (handler_api.php), so the whole order
-lifecycle in plugins/numflow.py works unchanged: getNumberV2 -> getStatus -> setStatus.
-
-Admin commands
-  /tbalance                       panel balance
-  /tservices [text]               list app codes (e.g. wa, tg, ig ...)
-  /tbuy <service> <country>       get a number manually
-  /tstatus <id>  /tcancel <id>  /tdone <id>
-  /tempora                        website link
+Cross-operator routing and automatic fallbacks across all operators.
 """
 import asyncio
 import json
@@ -25,32 +11,29 @@ import urllib.request
 
 from config import ADMIN_IDS, TEMPORA_API_KEY, TEMPORA_API_URL, TEMPORA_WEB_URL, logger
 
-# errors that mean "stop, do not retry with other parameters"
-_HARD_ERRORS = ("NO_NUMBERS", "NO_BALANCE", "BAD_KEY", "USER_BANNED", "TOO_MANY_REQUESTS", "WRONG_SERVICE",
-                "NO_ACTIVATION")
+# TemporaSMS active operator IDs
+ALL_OPERATORS = ["1", "2", "7", "8", "9", "10", "11", "12", "13", "15", "16"]
 
-_status_action = {"name": "getStatus"}     # falls back to getSms when the panel rejects getStatus
-
+_HARD_ERRORS = ("NO_BALANCE", "BAD_KEY", "USER_BANNED")
+_status_action = {"name": "getStatus"}
 
 def tempora_enabled():
     return bool((TEMPORA_API_KEY or "").strip())
 
-
 # ───────────── low level ─────────────
 def _call_sync(params):
     params = {"api_key": TEMPORA_API_KEY, **params}
+    params = {k: v for k, v in params.items() if v is not None}
     url = f"{TEMPORA_API_URL}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (BetaBot)"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode(errors="ignore").strip()
-    except urllib.error.HTTPError as ex:      # 4xx bodies carry the real error text
+    except urllib.error.HTTPError as ex:
         return ex.read().decode(errors="ignore").strip() or f"HTTP_{ex.code}"
-
 
 async def tp_call(**params):
     return await asyncio.to_thread(_call_sync, params)
-
 
 def _json(text):
     try:
@@ -58,17 +41,14 @@ def _json(text):
     except Exception:
         return None
 
-
 def _error_text(res):
     d = _json(res)
     if isinstance(d, dict):
         return str(d.get("title") or d.get("message") or d.get("error") or d.get("status") or res)[:160]
     return str(res)[:160]
 
-
 # ───────────── code extraction ─────────────
 def extract_code(value):
-    """The panel may hand back just the code or the whole SMS text. Return only the code."""
     v = str(value or "").strip()
     if not v:
         return v
@@ -80,9 +60,7 @@ def extract_code(value):
     m = re.search(r"\b\d{4,8}\b", v)
     return m.group(0) if m else v
 
-
 def normalize_status(res):
-    """-> 'STATUS_OK:<code>' | 'STATUS_WAIT_CODE' | 'STATUS_CANCEL' | raw error text."""
     res = (res or "").strip()
     if res.startswith("STATUS_OK"):
         return "STATUS_OK:" + extract_code(res.split(":", 1)[1] if ":" in res else "")
@@ -103,42 +81,45 @@ def normalize_status(res):
         return "STATUS_WAIT_CODE"
     return res
 
-
 # ───────────── account ─────────────
 async def get_balance():
     res = await tp_call(action="getBalance")
     return res.split(":", 1)[1] if res.startswith("ACCESS_BALANCE") else res
 
-
-# ───────────── numbers ─────────────
+# ───────────── numbers (all operators) ─────────────
 async def get_number(service, country, max_price=None):
-    """Buy a number with the smart router. Returns {activationId, phoneNumber, activationCost}; raises on failure."""
+    """Buy a number across all operators using smart routing and direct operator fallbacks."""
     base = {"service": service, "country": country}
-    attempts = []
     if max_price:
-        attempts.append({**base, "operator": "smart", "maxPrice": max_price})
-    attempts.append({**base, "operator": "smart"})
-    if max_price:
-        attempts.append({**base, "maxPrice": max_price})     # price-first auto mode
-    last = "no number"
-    for p in attempts:
-        res = await tp_call(action="getNumberV2", **p)
+        base["maxPrice"] = max_price
+
+    # Step 1: TemporaSMS built-in cross-operator smart router
+    for strat in ["smart", "auto", "cheap"]:
+        p = {**base, "type": strat}
+        res = await tp_call(action="getNumber", **p)
         d = _json(res)
         if isinstance(d, dict) and d.get("activationId") is not None:
             return d
         m = re.match(r"ACCESS_NUMBER:(\d+):(\+?\d+)", res or "")
         if m:
             return {"activationId": m.group(1), "phoneNumber": m.group(2)}
-        if "BAD_ACTION" in (res or ""):                       # panel without V2 -> classic getNumber
-            res = await tp_call(action="getNumber", **p)
-            m = re.match(r"ACCESS_NUMBER:(\d+):(\+?\d+)", res or "")
-            if m:
-                return {"activationId": m.group(1), "phoneNumber": m.group(2)}
+
+    # Step 2: Loop through every operator ID individually
+    last = "no number"
+    for op in ALL_OPERATORS:
+        p = {**base, "operator": op}
+        res = await tp_call(action="getNumber", **p)
+        d = _json(res)
+        if isinstance(d, dict) and d.get("activationId") is not None:
+            return d
+        m = re.match(r"ACCESS_NUMBER:(\d+):(\+?\d+)", res or "")
+        if m:
+            return {"activationId": m.group(1), "phoneNumber": m.group(2)}
         last = _error_text(res)
         if any(h in (res or "") for h in _HARD_ERRORS):
             break
-    raise Exception(last)
 
+    raise Exception(last)
 
 async def get_status(act_id):
     res = await tp_call(action=_status_action["name"], id=act_id)
@@ -147,18 +128,14 @@ async def get_status(act_id):
         res = await tp_call(action="getSms", id=act_id)
     return normalize_status(res)
 
-
 async def set_status(act_id, status):
     return await tp_call(action="setStatus", id=act_id, status=status)
 
-
 # ───────────── catalog: apps & countries ─────────────
-_services = {"t": 0, "data": []}     # [(code, name)]
-_countries = {"t": 0, "data": {}}    # {country_id: english name}
-
+_services = {"t": 0, "data": []}
+_countries = {"t": 0, "data": {}}
 EMOJI = {"ig": "📸", "fb": "📘", "go": "▶️", "tw": "🐦", "tk": "🎵", "ds": "🎮", "vk": "🌐", "ub": "🚗",
          "wa": "💬", "tg": "✈️", "ot": "📲"}
-
 
 def _parse_services(raw):
     out = []
@@ -181,13 +158,11 @@ def _parse_services(raw):
             out.append((str(code), str(name or code)))
     return out
 
-
 async def get_services():
-    """[(code, name)] of every app the panel supports. Cached 1 h (stale copy kept if the panel is down)."""
     if _services["data"] and time.time() - _services["t"] < 3600:
         return _services["data"]
     try:
-        data = _parse_services(await tp_call(action="getServices"))
+        data = _parse_services(await tp_call(action="getServices", operator="1"))
     except Exception as ex:
         logger.warning("temporasms getServices: %s", ex)
         data = []
@@ -195,22 +170,19 @@ async def get_services():
         _services.update(t=time.time(), data=data)
     return _services["data"]
 
-
 def service_label(code):
-    """(emoji, name) for any app code, usable before the catalog has loaded."""
     for c, n in _services["data"]:
         if c == code:
             return EMOJI.get(code, "📲"), n
     return EMOJI.get(code, "📲"), {"wa": "WhatsApp", "tg": "Telegram", "ig": "Instagram", "fb": "Facebook",
                                     "go": "YouTube / Google"}.get(code, str(code).upper())
 
-
 async def get_country_names():
     if _countries["data"] and time.time() - _countries["t"] < 3600:
         return _countries["data"]
     data = {}
     try:
-        raw = _json(await tp_call(action="getCountries"))
+        raw = _json(await tp_call(action="getCountries", operator="1"))
         if isinstance(raw, dict) and isinstance(raw.get("countries"), (list, dict)):
             raw = raw["countries"]
         items = raw.items() if isinstance(raw, dict) else enumerate(raw or [])
@@ -226,10 +198,8 @@ async def get_country_names():
         _countries.update(t=time.time(), data=data)
     return _countries["data"]
 
-
 # ───────────── prices ─────────────
 def _offer(d):
-    """One price entry -> (cost_usd, count) or None. Handles {cost,count} and {price: count} maps."""
     if not isinstance(d, dict):
         return None
     cost = d.get("cost", d.get("price"))
@@ -250,12 +220,10 @@ def _offer(d):
         return None
     return min(p[0] for p in pairs), sum(p[1] for p in pairs)
 
-
 def parse_prices(data, service):
-    """[(country_id, cost_usd, count)] cheapest first — tolerant to the shapes the panel may return."""
     out = []
     if isinstance(data, dict) and isinstance(data.get(service), dict) and not _offer(data.get(service)):
-        data = data[service]            # {service: {country: offer}}
+        data = data[service]
         pairs = list(data.items())
     elif isinstance(data, dict):
         pairs = [(cid, (svcs or {}).get(service) if isinstance(svcs, dict) and service in svcs
@@ -269,9 +237,9 @@ def parse_prices(data, service):
     out.sort(key=lambda x: x[1])
     return out
 
-
 async def list_prices(service):
-    res = await tp_call(action="getPrices", service=service)
+    # Try with operator=1 for prices
+    res = await tp_call(action="getPrices", service=service, operator="1")
     data = _json(res)
     if data is None:
         raise Exception(f"bad response: {res[:120]}")
@@ -279,7 +247,6 @@ async def list_prices(service):
     if not rows:
         raise Exception("no stock")
     return rows
-
 
 # ───────────── admin commands ─────────────
 def register_temporasms(bot):
